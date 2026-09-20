@@ -1,33 +1,17 @@
-# NIFTY 50 SBC Manual Signal Dashboard
+# NIFTY50 SBC Supply/Demand Render Dashboard
 
-## Render deployment
+## Render settings
 
-Build command:
+Build Command:
 `pip install -r requirements.txt`
 
-Start command:
-`gunicorn --workers 1 --timeout 180 app:app`
+Start Command:
+`gunicorn --workers 1 --timeout 120 --access-logfile - app:app`
 
-The app binds to `0.0.0.0:$PORT`.
+The application deliberately does NOT download Yahoo Finance data during Flask/Gunicorn startup.
 
-## What was fixed for Render
-- Yahoo Finance downloads are split into small batches to reduce rate limiting.
-- Downloads use one thread and retry logic.
-- Zone confirmation checks the impulse candle only when it exists.
-- One Gunicorn worker is used to reduce memory usage on Render Free.
-- Request timeout is extended for the first cold calculation.
+Open the dashboard and click **Refresh Yahoo Data**. The refresh runs in a background thread and the dashboard remains available even if Yahoo temporarily rate-limits individual stocks.
 
-## Strategy
-- SBC = Body / (High-Low) <= 0.50
-- Consecutive SBC candles form one base.
-- Demand confirmation = close above base high by X%.
-- Supply confirmation = close below base low by X%.
-- Demand tap -> BUY.
-- Demand tap with open basket -> AVERAGE.
-- Supply tap with profitable basket -> SELL.
-- Supply tap while losing -> HOLD.
-- Signals are recommendations only; trades are executed manually.
+The dashboard uses cached data when available and preserves previously cached stocks if a refresh fails for a symbol.
 
-## Important
-The dashboard does not place broker orders.
-The displayed capital is a manual planning input and is not connected to a brokerage account.
+Manual trading only. No broker orders are placed.
