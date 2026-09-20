@@ -3,6 +3,9 @@ import os
 import json
 import time
 import threading
+import urllib.request
+import urllib.error
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -57,6 +60,33 @@ REFRESH_STATUS = {
 
 # In-memory raw data cache.
 DATA = {}
+
+# DhanHQ configuration. Keep the access token in Render Environment Variables;
+# never put the token in source code or the browser. Dhan access tokens are
+# time-limited (typically 24 hours when generated from Dhan Web).
+DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "").strip()
+DHAN_CLIENT_ID = os.environ.get("DHAN_CLIENT_ID", "").strip()
+
+# Dhan trading symbols do not always exactly match Yahoo symbols. These aliases
+# cover common NIFTY 50 naming differences and can be extended if required.
+DHAN_TO_YAHOO = {
+    "M&M": "M&M.NS",
+    "MM": "M&M.NS",
+    "BAJAJ-AUTO": "BAJAJ-AUTO.NS",
+    "BAJAJFINSV": "BAJAJFINSV.NS",
+    "BAJFINANCE": "BAJFINANCE.NS",
+    "TATAMOTORS": "TATAMOTORS.NS",
+    "ETERNAL": "ETERNAL.NS",
+}
+
+DHAN_HOLDINGS = []
+DHAN_STATUS = {
+    "connected": bool(DHAN_ACCESS_TOKEN),
+    "last_sync": None,
+    "message": "Dhan is not configured. Add DHAN_ACCESS_TOKEN in Render Environment Variables (DHAN_CLIENT_ID is optional).",
+    "count": 0,
+}
+DHAN_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -251,6 +281,147 @@ def start_refresh(period="5y"):
 
 # IMPORTANT: load cache only. NEVER download data during import/startup.
 load_cache()
+
+
+# ============================================================
+# DHAN HOLDINGS
+# ============================================================
+def dhan_get_holdings():
+    """Fetch current demat holdings from DhanHQ without exposing the token."""
+    token = os.environ.get("DHAN_ACCESS_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("DHAN_ACCESS_TOKEN is not configured in Render Environment Variables.")
+
+    req = urllib.request.Request(
+        "https://api.dhan.co/v2/holdings",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "access-token": token,
+            **({"dhanClientId": DHAN_CLIENT_ID} if DHAN_CLIENT_ID else {}),
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Dhan API HTTP {exc.code}: {body[:500]}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Dhan API connection failed: {exc}") from exc
+
+    try:
+        data = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError("Dhan API returned an invalid JSON response.") from exc
+
+    if not isinstance(data, list):
+        # Dhan may return an error object rather than the holdings array.
+        raise RuntimeError(f"Dhan API returned an unexpected response: {str(data)[:500]}")
+
+    return data
+
+
+def normalize_dhan_symbol(symbol):
+    """Normalize Dhan trading symbols for matching against the NIFTY50 universe."""
+    s = str(symbol or "").strip().upper()
+    # Common exchange/security suffixes returned by broker APIs.
+    s = re.sub(r"[-_ ]?(EQ|BE|ETF|N1|N2|N3|N4|N5)$", "", s).strip()
+    aliases = {
+        "MM": "M&M",
+        "M&M": "M&M",
+        "BAJAJ-AUTO": "BAJAJ-AUTO",
+        "BAJAJFINSV": "BAJAJFINSV",
+        "BAJFINANCE": "BAJFINANCE",
+        "TATAMOTORS": "TATAMOTORS",
+        "ETERNAL": "ETERNAL",
+    }
+    return aliases.get(s, s)
+
+
+def dhan_symbol_to_yahoo(trading_symbol):
+    symbol = normalize_dhan_symbol(trading_symbol)
+    if symbol in DHAN_TO_YAHOO:
+        return DHAN_TO_YAHOO[symbol]
+    return symbol + ".NS"
+
+
+def sync_dhan_holdings():
+    global DHAN_HOLDINGS, DHAN_STATUS
+    holdings = dhan_get_holdings()
+
+    normalized = []
+    for h in holdings:
+        symbol = str(h.get("tradingSymbol", "")).strip()
+        if not symbol:
+            continue
+        normalized.append({
+            "symbol": symbol,
+            "normalized_symbol": normalize_dhan_symbol(symbol),
+            "yahoo_symbol": dhan_symbol_to_yahoo(symbol),
+            "security_id": str(h.get("securityId", "")),
+            "isin": str(h.get("isin", "")),
+            "total_qty": int(h.get("totalQty", 0) or 0),
+            "available_qty": int(h.get("availableQty", 0) or 0),
+            "dp_qty": int(h.get("dpQty", 0) or 0),
+            "t1_qty": int(h.get("t1Qty", 0) or 0),
+            "avg_cost": float(h.get("avgCostPrice", 0) or 0),
+        })
+
+    with DHAN_LOCK:
+        DHAN_HOLDINGS = normalized
+        DHAN_STATUS = {
+            "connected": True,
+            "last_sync": datetime.utcnow().isoformat(),
+            "message": f"Dhan holdings synced successfully: {len(normalized)} holdings.",
+            "count": len(normalized),
+        }
+
+    return normalized
+
+
+def match_holdings_to_signals(holdings, signals):
+    """Match live Dhan holdings to the dashboard's current SBC signals."""
+    signal_map = {}
+    for r in signals:
+        sym = normalize_dhan_symbol(r.get("symbol", ""))
+        signal_map[sym] = r
+
+    rows = []
+    for h in holdings:
+        symbol = normalize_dhan_symbol(h.get("symbol", ""))
+        sig = signal_map.get(symbol)
+
+        signal = sig.get("signal", "NO SIGNAL") if sig else "NO SIGNAL"
+        price = float(sig.get("price", 0) or 0) if sig else 0.0
+        qty = int(h.get("total_qty", 0) or 0)
+        avg_cost = float(h.get("avg_cost", 0) or 0)
+
+        pnl = (price - avg_cost) * qty if price > 0 and avg_cost > 0 else None
+        pnl_pct = ((price / avg_cost) - 1.0) * 100 if price > 0 and avg_cost > 0 else None
+
+        if sig is None:
+            match = "NOT IN NIFTY50"
+        elif "SELL" in signal:
+            match = "SELL SIGNAL"
+        elif signal in ("BUY", "AVERAGE"):
+            match = "BUY / ADD SIGNAL"
+        elif signal == "HOLD":
+            match = "HOLD"
+        else:
+            match = "WAIT"
+
+        rows.append({
+            **h,
+            "signal": signal,
+            "price": price,
+            "match": match,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+        })
+
+    return rows
 
 
 # ============================================================
@@ -620,6 +791,60 @@ Refresh runs in the background, so the webpage does not wait for Yahoo Finance a
 </div>
 
 <div class="card">
+<h2>🏦 Dhan Demat Holdings Sync</h2>
+<div class="small">
+Read-only portfolio sync. Holdings are fetched from Dhan and matched against the current SBC signal table.
+This dashboard <b>does not place, modify, or sell orders</b>.
+</div>
+<div class="controls" style="margin-top:10px">
+<div><button class="primary" onclick="syncDhan()">↻ Sync Dhan Holdings</button></div>
+<div><b>Configured:</b> {{ "Yes" if dhan_status.connected else "No" }}</div>
+<div><b>Holdings:</b> {{ dhan_status.count }}</div>
+<div><b>Last sync:</b> {{ dhan_status.last_sync|default("-") }}</div>
+</div>
+<div id="dhanStatus" class="small" style="margin-top:8px">{{ dhan_status.message }}</div>
+<div class="small" style="margin-top:8px">
+Set <code>DHAN_ACCESS_TOKEN</code> in Render → Environment.
+Optional: set <code>DHAN_CLIENT_ID</code> as well. The token is kept server-side and is never sent to the browser.
+</div>
+</div>
+
+{% if matched_holdings %}
+<div class="card">
+<h2>📊 My Dhan Holdings vs SBC Signal</h2>
+<div class="small" style="margin-bottom:10px">
+The table includes all Dhan holdings. NIFTY50 holdings are matched to the current signal; other holdings are marked <b>NOT IN NIFTY50</b>.
+</div>
+<table>
+<thead><tr>
+<th>Stock</th><th>Holding Qty</th><th>Avg Cost</th><th>Signal Price</th>
+<th>Holding P&L</th><th>SBC Signal</th><th>Match</th>
+</tr></thead>
+<tbody>
+{% for h in matched_holdings %}
+<tr>
+<td><b>{{ h.symbol }}</b></td>
+<td>{{ h.total_qty }}</td>
+<td>₹{{ "{:,.2f}".format(h.avg_cost) }}</td>
+<td>{% if h.price %}₹{{ "{:,.2f}".format(h.price) }}{% else %}-{% endif %}</td>
+<td>{% if h.pnl is not none %}₹{{ "{:,.2f}".format(h.pnl) }} ({{ "%.2f"|format(h.pnl_pct) }}%){% else %}-{% endif %}</td>
+<td>
+<span class="badge
+{% if h.signal=='BUY' %}buy
+{% elif h.signal=='AVERAGE' %}avg
+{% elif 'SELL' in h.signal %}sell
+{% elif h.signal=='HOLD' %}hold
+{% else %}wait{% endif %}">{{ h.signal }}</span>
+</td>
+<td><b>{{ h.match }}</b></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+
+<div class="card">
 <h2>Recommendations</h2>
 <div class="small">
 {{ timeframe|capitalize }} · X={{ "%.2f"|format(x_pct*100) }}% ·
@@ -686,6 +911,19 @@ async function refreshData() {
     }
 }
 
+async function syncDhan() {
+    const status = document.getElementById("dhanStatus");
+    status.textContent = "Syncing Dhan holdings...";
+    try {
+        const r = await fetch("/dhan/sync", {method:"POST"});
+        const data = await r.json();
+        status.textContent = data.message || "Dhan sync completed.";
+        setTimeout(() => location.reload(), 800);
+    } catch(e) {
+        status.textContent = "Could not sync Dhan holdings: " + e;
+    }
+}
+
 async function pollRefresh() {
     try {
         const r = await fetch("/refresh_status");
@@ -742,6 +980,11 @@ def dashboard():
         with DATA_LOCK:
             status = dict(REFRESH_STATUS)
             cached_count = len(DATA)
+        with DHAN_LOCK:
+            dhan_status = dict(DHAN_STATUS)
+            dhan_holdings = list(DHAN_HOLDINGS)
+
+        matched_holdings = match_holdings_to_signals(dhan_holdings, results) if dhan_holdings else []
 
         return render_template_string(
             HTML,
@@ -753,6 +996,8 @@ def dashboard():
             capital=capital,
             refresh=status,
             cached_count=cached_count,
+            dhan_status=dhan_status,
+            matched_holdings=matched_holdings,
         )
     except Exception as exc:
         # Never let a strategy calculation exception kill the web worker.
@@ -769,11 +1014,44 @@ def health():
     with DATA_LOCK:
         count = len(DATA)
         running = REFRESH_STATUS["running"]
+    with DHAN_LOCK:
+        dstatus = dict(DHAN_STATUS)
     return jsonify({
         "status": "ok",
         "cached_stocks": count,
         "refresh_running": running,
+        "dhan_connected": dstatus["connected"],
+        "dhan_holdings": dstatus["count"],
+        "dhan_last_sync": dstatus["last_sync"],
     })
+
+
+@app.route("/dhan/sync", methods=["POST"])
+def dhan_sync():
+    try:
+        holdings = sync_dhan_holdings()
+        return jsonify({
+            "success": True,
+            "count": len(holdings),
+            "message": f"Dhan holdings synced successfully: {len(holdings)} holdings loaded.",
+        })
+    except Exception as exc:
+        with DHAN_LOCK:
+            DHAN_STATUS["connected"] = bool(os.environ.get("DHAN_ACCESS_TOKEN", "").strip())
+            DHAN_STATUS["message"] = str(exc)
+        return jsonify({
+            "success": False,
+            "count": 0,
+            "message": f"Dhan sync failed: {exc}",
+        }), 200
+
+
+@app.route("/dhan/status")
+def dhan_status_api():
+    with DHAN_LOCK:
+        holdings = list(DHAN_HOLDINGS)
+        status = dict(DHAN_STATUS)
+    return jsonify({"status": status, "holdings": holdings})
 
 
 @app.route("/refresh", methods=["POST"])

@@ -1,17 +1,33 @@
-# NIFTY50 SBC Supply/Demand Render Dashboard
+# NIFTY50 SBC Render Dashboard — Dhan Sync
 
-## Render settings
+## Dhan configuration in Render
 
-Build Command:
-`pip install -r requirements.txt`
+In **Render → Service → Environment**, add:
 
-Start Command:
-`gunicorn --workers 1 --timeout 120 --access-logfile - app:app`
+- `DHAN_ACCESS_TOKEN` = your current Dhan API access token
+- `DHAN_CLIENT_ID` = your Dhan client ID (optional, but recommended)
 
-The application deliberately does NOT download Yahoo Finance data during Flask/Gunicorn startup.
+Redeploy after saving environment variables.
 
-Open the dashboard and click **Refresh Yahoo Data**. The refresh runs in a background thread and the dashboard remains available even if Yahoo temporarily rate-limits individual stocks.
+## Dhan sync
 
-The dashboard uses cached data when available and preserves previously cached stocks if a refresh fails for a symbol.
+The dashboard has a **Sync Dhan Holdings** button.
 
-Manual trading only. No broker orders are placed.
+It:
+1. Calls Dhan `/v2/holdings` from the Render backend.
+2. Normalizes broker trading symbols.
+3. Matches holdings against the dashboard's NIFTY50 SBC signals.
+4. Shows holding quantity, average cost, signal price and calculated holding P&L.
+5. Marks each holding as `BUY / ADD SIGNAL`, `SELL SIGNAL`, `HOLD`, `WAIT`, or `NOT IN NIFTY50`.
+
+This is **read-only**. No Dhan orders are placed by the sync feature.
+
+The Dhan access token remains server-side in Render environment variables and is not exposed in the browser.
+
+## Start command
+
+If Render's Start Command field is used directly:
+
+`gunicorn --workers 1 --timeout 120 --bind 0.0.0.0:$PORT --access-logfile - app:app`
+
+Do not prefix that command with `web:` in Render's Start Command field.
