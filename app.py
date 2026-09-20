@@ -46,6 +46,9 @@ NIFTY50 = [
 CACHE_DIR = Path(os.environ.get("RENDER_DISK_PATH", "/tmp")) / "sbc_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_FILE = CACHE_DIR / "market_cache.json"
+CACHE_META_FILE = CACHE_DIR / "cache_meta.json"
+CACHE_VERSION = 2
+CACHE_LOOKBACK_DAYS = 10
 
 DATA_LOCK = threading.Lock()
 REFRESH_THREAD = None
@@ -53,7 +56,7 @@ REFRESH_STATUS = {
     "running": False,
     "started": None,
     "finished": None,
-    "message": "No refresh has been run yet.",
+    "message": "No refresh has been run yet. Cached history will be reused until Smart Refresh is clicked.",
     "success": 0,
     "failed": 0,
 }
@@ -186,20 +189,25 @@ def normalize_download(raw, symbol):
     return df if len(df) >= 50 else None
 
 
-def download_symbol(symbol, period="5y"):
-    # One ticker per request is slower but isolates Yahoo failures.
-    # It is deliberately NOT called during Flask startup.
+def download_symbol(symbol, period="5y", start_date=None):
+    """Download either initial history or only a small incremental window."""
     for attempt in range(2):
         try:
-            raw = yf.download(
-                symbol,
-                period=period,
+            kwargs = dict(
                 interval="1d",
                 auto_adjust=True,
                 progress=False,
                 threads=False,
                 timeout=20,
             )
+            if start_date is not None:
+                kwargs["start"] = start_date.strftime("%Y-%m-%d")
+                # A short explicit window avoids downloading the full history again.
+                kwargs["end"] = (datetime.utcnow().date() + timedelta(days=1)).strftime("%Y-%m-%d")
+            else:
+                kwargs["period"] = period
+
+            raw = yf.download(symbol, **kwargs)
             df = normalize_download(raw, symbol)
             if df is not None:
                 return df
@@ -209,7 +217,31 @@ def download_symbol(symbol, period="5y"):
     return None
 
 
+def _cache_latest(df):
+    if df is None or df.empty:
+        return None
+    return pd.to_datetime(df["date"], errors="coerce").max()
+
+
+def _merge_symbol_data(old_df, new_df):
+    if old_df is None or old_df.empty:
+        return new_df
+    if new_df is None or new_df.empty:
+        return old_df
+    merged = pd.concat([old_df, new_df], ignore_index=True)
+    merged["date"] = pd.to_datetime(merged["date"], errors="coerce")
+    merged = merged.dropna(subset=["date", "open", "high", "low", "close"])
+    merged = merged.drop_duplicates(subset=["date"], keep="last")
+    return merged.sort_values("date").reset_index(drop=True)
+
+
 def refresh_worker(period="5y"):
+    """Smart incremental refresh.
+
+    Existing symbols are NOT downloaded for their full history. Only the last
+    CACHE_LOOKBACK_DAYS are requested so today's/new candles can be appended.
+    A symbol with no cache is downloaded with the initial period.
+    """
     global REFRESH_STATUS, DATA
 
     with DATA_LOCK:
@@ -217,53 +249,73 @@ def refresh_worker(period="5y"):
             "running": True,
             "started": datetime.utcnow().isoformat(),
             "finished": None,
-            "message": "Refreshing market data in the background...",
+            "message": "Smart refresh started. Checking cached history...",
             "success": 0,
             "failed": 0,
+            "incremental": 0,
+            "initial": 0,
         }
 
-    new_data = {}
+    updated = 0
+    initial = 0
     failed = []
 
-    # Small pauses help reduce Yahoo burst/rate-limit problems.
     for idx, symbol in enumerate(NIFTY50):
-        df = download_symbol(symbol, period=period)
+        with DATA_LOCK:
+            old_df = DATA.get(symbol)
 
-        if df is not None:
-            new_data[symbol] = df
+        latest = _cache_latest(old_df)
+        if latest is not None:
+            # Re-fetch a small overlap so revised/latest candles are captured.
+            start_date = (latest - pd.Timedelta(days=CACHE_LOOKBACK_DAYS)).date()
+            df = download_symbol(symbol, start_date=start_date)
+            if df is not None:
+                merged = _merge_symbol_data(old_df, df)
+                with DATA_LOCK:
+                    DATA[symbol] = merged
+                updated += 1
+            else:
+                # A temporary Yahoo failure does not destroy the existing cache.
+                failed.append(symbol)
         else:
-            failed.append(symbol)
+            df = download_symbol(symbol, period=period)
+            if df is not None:
+                with DATA_LOCK:
+                    DATA[symbol] = df
+                initial += 1
+                updated += 1
+            else:
+                failed.append(symbol)
 
+        with DATA_LOCK:
+            REFRESH_STATUS["success"] = updated
+            REFRESH_STATUS["failed"] = len(failed)
+            REFRESH_STATUS["incremental"] = updated - initial
+            REFRESH_STATUS["initial"] = initial
+            REFRESH_STATUS["message"] = (
+                f"Processed {idx + 1}/{len(NIFTY50)} stocks. "
+                f"Incremental: {updated - initial}, initial: {initial}, "
+                f"failed: {len(failed)}."
+            )
+
+        # Keep Yahoo request rate conservative.
         if idx < len(NIFTY50) - 1:
             time.sleep(0.35)
 
-        with DATA_LOCK:
-            REFRESH_STATUS["success"] = len(new_data)
-            REFRESH_STATUS["failed"] = len(failed)
-            REFRESH_STATUS["message"] = (
-                f"Downloaded {len(new_data)}/{len(NIFTY50)} stocks. "
-                f"Failed: {len(failed)}."
-            )
-
-    # Preserve previously cached symbols when a refresh temporarily fails.
     with DATA_LOCK:
-        merged = dict(DATA)
-        merged.update(new_data)
-        DATA = merged
         save_cache()
-
         REFRESH_STATUS["running"] = False
         REFRESH_STATUS["finished"] = datetime.utcnow().isoformat()
         REFRESH_STATUS["message"] = (
-            f"Refresh complete. Available stocks: {len(DATA)}/{len(NIFTY50)}. "
-            f"New failures: {len(failed)}."
+            f"Refresh complete. Cache: {len(DATA)}/{len(NIFTY50)} stocks. "
+            f"Incremental: {updated - initial}, initial: {initial}, "
+            f"failed: {len(failed)}. Historical data was preserved."
         )
 
     print(
-        f"Refresh complete: success={len(new_data)}, "
+        f"Smart refresh complete: updated={updated}, initial={initial}, "
         f"failed={len(failed)}, cached_total={len(DATA)}"
     )
-
 
 def start_refresh(period="5y"):
     global REFRESH_THREAD
@@ -779,17 +831,17 @@ th { background:#f1f4f8; position:sticky; top:0; }
 <div class="card">
 <div class="controls">
 <div>
-<button class="primary" onclick="refreshData()">Refresh Yahoo Data</button>
+<button class="primary" onclick="refreshData()">Smart Refresh Yahoo Data</button>
 </div>
 <div>
-<b>Cached stocks:</b> {{ cached_count }}/50
+<b>Cached stocks:</b> {{ cached_count }}/50<br><b>Cache mode:</b> Incremental history ({{ cached_rows }} rows)
 </div>
 <div>
 <b>Last status:</b> <span id="refreshStatus">{{ refresh.message }}</span>
 </div>
 </div>
 <div class="small" style="margin-top:8px">
-Refresh runs in the background, so the webpage does not wait for Yahoo Finance and should not produce a 502 merely because Yahoo is slow or rate-limits a stock.
+Smart Refresh runs in the background. Existing historical data stays on the server cache; only a small recent window is fetched from Yahoo for each cached stock. The first refresh still performs the initial download for stocks with no cache.
 </div>
 </div>
 
@@ -1022,6 +1074,7 @@ def dashboard():
         with DATA_LOCK:
             status = dict(REFRESH_STATUS)
             cached_count = len(DATA)
+            cached_rows = sum(len(df) for df in DATA.values())
         with DHAN_LOCK:
             dhan_status = dict(DHAN_STATUS)
             dhan_holdings = list(DHAN_HOLDINGS)
@@ -1038,6 +1091,7 @@ def dashboard():
             capital=capital,
             refresh=status,
             cached_count=cached_count,
+            cached_rows=cached_rows,
             dhan_status=dhan_status,
             matched_holdings=matched_holdings,
         )
