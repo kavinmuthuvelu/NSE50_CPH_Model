@@ -1,33 +1,14 @@
-# NIFTY50 SBC Render Dashboard — Dhan Sync
+# NIFTY50 SBC Render Dashboard — Dhan Web Token
 
-## Dhan configuration in Render
+Dhan tokens expire daily. Enter a fresh token directly on the dashboard.
 
-In **Render → Service → Environment**, add:
+Daily workflow:
+1. Generate today's Dhan API access token.
+2. Paste it into **Dhan Access Token**.
+3. Optionally enter Client ID.
+4. Click **Save Token**.
+5. Click **Sync Dhan Holdings**.
 
-- `DHAN_ACCESS_TOKEN` = your current Dhan API access token
-- `DHAN_CLIENT_ID` = your Dhan client ID (optional, but recommended)
+The webpage token takes priority over the optional `DHAN_ACCESS_TOKEN` Render environment variable. The entered token is held only in server memory; if Render restarts/sleeps/redeploys, enter it again.
 
-Redeploy after saving environment variables.
-
-## Dhan sync
-
-The dashboard has a **Sync Dhan Holdings** button.
-
-It:
-1. Calls Dhan `/v2/holdings` from the Render backend.
-2. Normalizes broker trading symbols.
-3. Matches holdings against the dashboard's NIFTY50 SBC signals.
-4. Shows holding quantity, average cost, signal price and calculated holding P&L.
-5. Marks each holding as `BUY / ADD SIGNAL`, `SELL SIGNAL`, `HOLD`, `WAIT`, or `NOT IN NIFTY50`.
-
-This is **read-only**. No Dhan orders are placed by the sync feature.
-
-The Dhan access token remains server-side in Render environment variables and is not exposed in the browser.
-
-## Start command
-
-If Render's Start Command field is used directly:
-
-`gunicorn --workers 1 --timeout 120 --bind 0.0.0.0:$PORT --access-logfile - app:app`
-
-Do not prefix that command with `web:` in Render's Start Command field.
+The Dhan sync is read-only.

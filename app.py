@@ -66,6 +66,8 @@ DATA = {}
 # time-limited (typically 24 hours when generated from Dhan Web).
 DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "").strip()
 DHAN_CLIENT_ID = os.environ.get("DHAN_CLIENT_ID", "").strip()
+WEB_DHAN_TOKEN = ""
+WEB_DHAN_CLIENT_ID = ""
 
 # Dhan trading symbols do not always exactly match Yahoo symbols. These aliases
 # cover common NIFTY 50 naming differences and can be extended if required.
@@ -288,9 +290,10 @@ load_cache()
 # ============================================================
 def dhan_get_holdings():
     """Fetch current demat holdings from DhanHQ without exposing the token."""
-    token = os.environ.get("DHAN_ACCESS_TOKEN", "").strip()
+    token = WEB_DHAN_TOKEN or DHAN_ACCESS_TOKEN
+    client_id = WEB_DHAN_CLIENT_ID or DHAN_CLIENT_ID
     if not token:
-        raise RuntimeError("DHAN_ACCESS_TOKEN is not configured in Render Environment Variables.")
+        raise RuntimeError("Enter the Dhan API access token on the webpage first.")
 
     req = urllib.request.Request(
         "https://api.dhan.co/v2/holdings",
@@ -298,7 +301,7 @@ def dhan_get_holdings():
             "Content-Type": "application/json",
             "Accept": "application/json",
             "access-token": token,
-            **({"dhanClientId": DHAN_CLIENT_ID} if DHAN_CLIENT_ID else {}),
+            **({"dhanClientId": client_id} if client_id else {}),
         },
         method="GET",
     )
@@ -793,19 +796,36 @@ Refresh runs in the background, so the webpage does not wait for Yahoo Finance a
 <div class="card">
 <h2>🏦 Dhan Demat Holdings Sync</h2>
 <div class="small">
-Read-only portfolio sync. Holdings are fetched from Dhan and matched against the current SBC signal table.
-This dashboard <b>does not place, modify, or sell orders</b>.
+Dhan API tokens expire daily. Enter the fresh token here each day — no Render redeploy is required.
+The token is sent to the backend over HTTPS and kept only in server memory.
+This feature is <b>read-only</b> and does not place or modify orders.
+</div>
+<div class="controls" style="margin-top:12px">
+<div style="min-width:280px;flex:1">
+<label style="display:block;font-size:12px;margin-bottom:5px">Dhan Access Token</label>
+<input id="dhanToken" type="password" placeholder="Paste today's Dhan API access token"
+style="width:100%;padding:10px;border:1px solid #334155;border-radius:7px;background:#0f172a;color:#fff">
+</div>
+<div style="min-width:200px">
+<label style="display:block;font-size:12px;margin-bottom:5px">Client ID (optional)</label>
+<input id="dhanClientId" type="text" placeholder="Dhan Client ID"
+style="width:100%;padding:10px;border:1px solid #334155;border-radius:7px;background:#0f172a;color:#fff">
+</div>
+<div style="display:flex;gap:8px;align-items:end">
+<button class="primary" onclick="saveDhanToken()">Save Token</button>
+<button class="secondary" onclick="clearDhanToken()">Clear</button>
+<button class="primary" onclick="syncDhan()">↻ Sync Dhan Holdings</button>
+</div>
+</div>
+<div id="dhanStatus" class="small" style="margin-top:10px">{{ dhan_status.message }}</div>
+<div class="small" style="margin-top:8px">
+<b>Daily workflow:</b> Generate today's token in Dhan → paste → Save Token → Sync Dhan Holdings.
+If Render restarts or sleeps, enter the token again.
 </div>
 <div class="controls" style="margin-top:10px">
-<div><button class="primary" onclick="syncDhan()">↻ Sync Dhan Holdings</button></div>
 <div><b>Configured:</b> {{ "Yes" if dhan_status.connected else "No" }}</div>
 <div><b>Holdings:</b> {{ dhan_status.count }}</div>
 <div><b>Last sync:</b> {{ dhan_status.last_sync|default("-") }}</div>
-</div>
-<div id="dhanStatus" class="small" style="margin-top:8px">{{ dhan_status.message }}</div>
-<div class="small" style="margin-top:8px">
-Set <code>DHAN_ACCESS_TOKEN</code> in Render → Environment.
-Optional: set <code>DHAN_CLIENT_ID</code> as well. The token is kept server-side and is never sent to the browser.
 </div>
 </div>
 
@@ -909,6 +929,28 @@ async function refreshData() {
     } catch(e) {
         status.textContent = "Could not start refresh: " + e;
     }
+}
+
+async function saveDhanToken(){
+  const token=(document.getElementById("dhanToken")?.value||"").trim();
+  const clientId=(document.getElementById("dhanClientId")?.value||"").trim();
+  const status=document.getElementById("dhanStatus");
+  if(!token){if(status)status.textContent="Please paste today's Dhan access token.";return;}
+  if(status)status.textContent="Saving token…";
+  try{
+    const r=await fetch("/dhan/credentials",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:token,client_id:clientId})});
+    const j=await r.json();
+    if(!r.ok||!j.ok)throw new Error(j.error||"Unable to save token");
+    document.getElementById("dhanToken").value="";
+    if(status)status.textContent="✓ Token saved. Now click Sync Dhan Holdings.";
+  }catch(e){if(status)status.textContent="Error: "+e.message;}
+}
+async function clearDhanToken(){
+  try{
+    await fetch("/dhan/credentials/clear",{method:"POST"});
+    const status=document.getElementById("dhanStatus");
+    if(status)status.textContent="Dhan token cleared.";
+  }catch(e){}
 }
 
 async function syncDhan() {
@@ -1044,6 +1086,35 @@ def dhan_sync():
             "count": 0,
             "message": f"Dhan sync failed: {exc}",
         }), 200
+
+
+@app.route("/dhan/credentials", methods=["POST"])
+def dhan_credentials():
+    global WEB_DHAN_TOKEN, WEB_DHAN_CLIENT_ID
+    data = request.get_json(silent=True) or {}
+    token = str(data.get("token", "")).strip()
+    client_id = str(data.get("client_id", "")).strip()
+    if not token:
+        return jsonify({"ok": False, "error": "Please enter the Dhan access token."}), 400
+    WEB_DHAN_TOKEN = token
+    WEB_DHAN_CLIENT_ID = client_id
+    with DHAN_LOCK:
+        DHAN_STATUS["connected"] = False
+        DHAN_STATUS["message"] = "Token saved. Click Sync Dhan Holdings."
+    return jsonify({"ok": True})
+
+
+@app.route("/dhan/credentials/clear", methods=["POST"])
+def dhan_credentials_clear():
+    global WEB_DHAN_TOKEN, WEB_DHAN_CLIENT_ID
+    WEB_DHAN_TOKEN = ""
+    WEB_DHAN_CLIENT_ID = ""
+    with DHAN_LOCK:
+        DHAN_HOLDINGS.clear()
+        DHAN_STATUS["connected"] = False
+        DHAN_STATUS["count"] = 0
+        DHAN_STATUS["message"] = "Dhan token cleared."
+    return jsonify({"ok": True})
 
 
 @app.route("/dhan/status")
