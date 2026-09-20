@@ -6,6 +6,8 @@ import threading
 import urllib.request
 import urllib.error
 import re
+import base64
+import io
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -47,6 +49,8 @@ CACHE_DIR = Path(os.environ.get("RENDER_DISK_PATH", "/tmp")) / "sbc_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_FILE = CACHE_DIR / "market_cache.json"
 CACHE_META_FILE = CACHE_DIR / "cache_meta.json"
+SYMBOL_CACHE_DIR = CACHE_DIR / "symbols"
+SYMBOL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_VERSION = 2
 CACHE_LOOKBACK_DAYS = 10
 
@@ -63,6 +67,8 @@ REFRESH_STATUS = {
 
 # In-memory raw data cache.
 DATA = {}
+SIGNAL_CACHE = {}
+SIGNAL_CACHE_LOCK = threading.Lock()
 
 # DhanHQ configuration. Keep the access token in Render Environment Variables;
 # never put the token in source code or the browser. Dhan access tokens are
@@ -94,46 +100,365 @@ DHAN_STATUS = {
 DHAN_LOCK = threading.Lock()
 
 
+
+# ============================================================
+# GITHUB PERSISTENT CACHE (V8)
+# ============================================================
+# GitHub is the persistent market-data cache. Render uses only its
+# temporary filesystem while the service is running.
+#
+# Required Render environment variables:
+#   GITHUB_CACHE_REPO=kavinmuthuvelu/nifty50-sbc-data
+#   GITHUB_CACHE_TOKEN=<fine-grained PAT, Contents: Read and write>
+# Optional:
+#   GITHUB_CACHE_BRANCH=main
+#   GITHUB_CACHE_DIR=data
+#
+# The token is server-side only and is never returned to the browser.
+
+GITHUB_CACHE_REPO = os.getenv("GITHUB_CACHE_REPO", "").strip()
+GITHUB_CACHE_TOKEN = os.getenv("GITHUB_CACHE_TOKEN", "").strip()
+GITHUB_CACHE_BRANCH = os.getenv("GITHUB_CACHE_BRANCH", "main").strip()
+GITHUB_CACHE_DIR = os.getenv("GITHUB_CACHE_DIR", "data").strip("/")
+
+GITHUB_CACHE_STATUS = {
+    "enabled": bool(GITHUB_CACHE_REPO and GITHUB_CACHE_TOKEN),
+    "pull_running": False,
+    "push_running": False,
+    "last_pull": None,
+    "last_push": None,
+    "last_error": None,
+    "pulled": 0,
+    "pushed": 0,
+}
+
+GITHUB_LOCK = threading.Lock()
+
+def github_cache_enabled():
+    return bool(GITHUB_CACHE_REPO and GITHUB_CACHE_TOKEN)
+
+def github_headers():
+    return {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {GITHUB_CACHE_TOKEN}",
+        "User-Agent": "NIFTY50-SBC-Render-V8",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+def github_api_url(path):
+    from urllib.parse import quote
+    return f"https://api.github.com/repos/{GITHUB_CACHE_REPO}/contents/{quote(path, safe='/')}"
+
+def github_data_path(symbol):
+    return f"{GITHUB_CACHE_DIR}/{symbol}.parquet"
+
+def github_pull_symbol(symbol):
+    """Download one Parquet cache file from GitHub into Render's local cache."""
+    if not github_cache_enabled():
+        return False
+
+    import requests
+    r = requests.get(
+        github_api_url(github_data_path(symbol)),
+        headers=github_headers(),
+        params={"ref": GITHUB_CACHE_BRANCH},
+        timeout=30,
+    )
+    if r.status_code == 404:
+        return False
+    r.raise_for_status()
+
+    obj = r.json()
+    content = base64.b64decode(obj.get("content", "").replace("\n", ""))
+    if not content:
+        return False
+
+    df = pd.read_parquet(io.BytesIO(content))
+    if df.empty:
+        return False
+
+    # Convert GitHub seed schema to the app's normalized schema.
+    rename = {}
+    for c in df.columns:
+        lc = str(c).lower()
+        if lc == "date":
+            rename[c] = "date"
+        elif lc == "open":
+            rename[c] = "open"
+        elif lc == "high":
+            rename[c] = "high"
+        elif lc == "low":
+            rename[c] = "low"
+        elif lc == "close":
+            rename[c] = "close"
+        elif lc == "volume":
+            rename[c] = "volume"
+    df = df.rename(columns=rename)
+
+    required = ["date", "open", "high", "low", "close"]
+    if any(c not in df.columns for c in required):
+        return False
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True).dt.tz_convert(None)
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=required).sort_values("date").reset_index(drop=True)
+    if len(df) < 50:
+        return False
+
+    with DATA_LOCK:
+        DATA[symbol] = df
+    _symbol_cache_file(symbol).parent.mkdir(parents=True, exist_ok=True)
+    tmp = _symbol_cache_file(symbol).with_suffix(".tmp")
+    df.to_pickle(tmp, compression="gzip")
+    tmp.replace(_symbol_cache_file(symbol))
+    return True
+
+def github_pull_missing_background():
+    if not github_cache_enabled():
+        return
+    with GITHUB_LOCK:
+        if GITHUB_CACHE_STATUS["pull_running"]:
+            return
+        GITHUB_CACHE_STATUS["pull_running"] = True
+        GITHUB_CACHE_STATUS["last_error"] = None
+
+    pulled = failed = 0
+    try:
+        for symbol in NIFTY50:
+            try:
+                with DATA_LOCK:
+                    exists = symbol in DATA and DATA[symbol] is not None and len(DATA[symbol]) >= 50
+                if exists:
+                    continue
+                if github_pull_symbol(symbol):
+                    pulled += 1
+                else:
+                    failed += 1
+            except Exception as exc:
+                failed += 1
+                GITHUB_CACHE_STATUS["last_error"] = f"{symbol}: {exc}"
+    finally:
+        GITHUB_CACHE_STATUS["pulled"] = pulled
+        GITHUB_CACHE_STATUS["last_pull"] = datetime.utcnow().isoformat()
+        GITHUB_CACHE_STATUS["pull_running"] = False
+        print(f"GitHub cache pull complete: pulled={pulled}, failed={failed}")
+
+def _github_parquet_bytes(symbol):
+    with DATA_LOCK:
+        df = DATA.get(symbol)
+    if df is None or df.empty:
+        return None
+
+    # GitHub stores the clean Parquet representation, not Render's pkl.gz cache.
+    bio = io.BytesIO()
+    out = df.copy()
+    out["Date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["Open"] = pd.to_numeric(out["open"], errors="coerce")
+    out["High"] = pd.to_numeric(out["high"], errors="coerce")
+    out["Low"] = pd.to_numeric(out["low"], errors="coerce")
+    out["Close"] = pd.to_numeric(out["close"], errors="coerce")
+    if "volume" in out.columns:
+        out["Volume"] = pd.to_numeric(out["volume"], errors="coerce")
+    else:
+        out["Volume"] = 0
+    cols = ["Date", "Open", "High", "Low", "Close", "Volume"]
+    out = out[cols].dropna(subset=["Date", "Open", "High", "Low", "Close"])
+    out.to_parquet(bio, index=False, compression="snappy")
+    return bio.getvalue()
+
+def github_get_ref_and_tree():
+    import requests
+    ref_url = f"https://api.github.com/repos/{GITHUB_CACHE_REPO}/git/ref/heads/{GITHUB_CACHE_BRANCH}"
+    rr = requests.get(ref_url, headers=github_headers(), timeout=30)
+    rr.raise_for_status()
+    ref = rr.json()
+    commit_sha = ref["object"]["sha"]
+
+    cr = requests.get(
+        f"https://api.github.com/repos/{GITHUB_CACHE_REPO}/git/commits/{commit_sha}",
+        headers=github_headers(),
+        timeout=30,
+    )
+    cr.raise_for_status()
+    return commit_sha, cr.json()["tree"]["sha"]
+
+def github_push_symbols(symbols):
+    """Batch all changed symbols into ONE GitHub commit."""
+    if not github_cache_enabled():
+        return {"enabled": False, "pushed": 0, "failed": len(symbols)}
+
+    symbols = [s for s in dict.fromkeys(symbols) if s in NIFTY50]
+    if not symbols:
+        return {"enabled": True, "pushed": 0, "failed": 0}
+
+    import requests
+
+    with GITHUB_LOCK:
+        if GITHUB_CACHE_STATUS["push_running"]:
+            return {"enabled": True, "pushed": 0, "failed": len(symbols), "message": "GitHub push already running."}
+        GITHUB_CACHE_STATUS["push_running"] = True
+        GITHUB_CACHE_STATUS["last_error"] = None
+
+    pushed = 0
+    try:
+        commit_sha, base_tree_sha = github_get_ref_and_tree()
+
+        # Create blobs.
+        tree_entries = []
+        for symbol in symbols:
+            raw = _github_parquet_bytes(symbol)
+            if not raw:
+                continue
+
+            br = requests.post(
+                f"https://api.github.com/repos/{GITHUB_CACHE_REPO}/git/blobs",
+                headers=github_headers(),
+                json={
+                    "content": base64.b64encode(raw).decode("ascii"),
+                    "encoding": "base64",
+                },
+                timeout=60,
+            )
+            br.raise_for_status()
+            blob_sha = br.json()["sha"]
+
+            tree_entries.append({
+                "path": github_data_path(symbol),
+                "mode": "100644",
+                "type": "blob",
+                "sha": blob_sha,
+            })
+            pushed += 1
+
+        if not tree_entries:
+            return {"enabled": True, "pushed": 0, "failed": len(symbols)}
+
+        # One tree + one commit + one ref update.
+        tr = requests.post(
+            f"https://api.github.com/repos/{GITHUB_CACHE_REPO}/git/trees",
+            headers=github_headers(),
+            json={"base_tree": base_tree_sha, "tree": tree_entries},
+            timeout=60,
+        )
+        tr.raise_for_status()
+        tree_sha = tr.json()["sha"]
+
+        cm = requests.post(
+            f"https://api.github.com/repos/{GITHUB_CACHE_REPO}/git/commits",
+            headers=github_headers(),
+            json={
+                "message": f"Update NIFTY50 Yahoo cache ({pushed} symbols)",
+                "tree": tree_sha,
+                "parents": [commit_sha],
+            },
+            timeout=60,
+        )
+        cm.raise_for_status()
+        new_commit = cm.json()["sha"]
+
+        ur = requests.patch(
+            f"https://api.github.com/repos/{GITHUB_CACHE_REPO}/git/refs/heads/{GITHUB_CACHE_BRANCH}",
+            headers=github_headers(),
+            json={"sha": new_commit, "force": False},
+            timeout=30,
+        )
+        ur.raise_for_status()
+
+        GITHUB_CACHE_STATUS["pushed"] = pushed
+        GITHUB_CACHE_STATUS["last_push"] = datetime.utcnow().isoformat()
+        return {"enabled": True, "pushed": pushed, "failed": len(symbols) - pushed}
+    except Exception as exc:
+        GITHUB_CACHE_STATUS["last_error"] = str(exc)
+        return {"enabled": True, "pushed": pushed, "failed": len(symbols) - pushed, "error": str(exc)}
+    finally:
+        GITHUB_CACHE_STATUS["push_running"] = False
+
+@app.route("/github/cache/status")
+def github_cache_status():
+    return jsonify({
+        **GITHUB_CACHE_STATUS,
+        "repo": GITHUB_CACHE_REPO or None,
+        "branch": GITHUB_CACHE_BRANCH,
+        "directory": GITHUB_CACHE_DIR,
+        "cached_local": len(DATA),
+    })
+
+
 # ============================================================
 # CACHE HELPERS
 # ============================================================
-def save_cache():
-    payload = {}
-    for symbol, df in DATA.items():
-        tmp = df.copy()
-        tmp["date"] = pd.to_datetime(tmp["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        payload[symbol] = tmp.to_dict(orient="records")
+def _symbol_cache_file(symbol):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", symbol)
+    return SYMBOL_CACHE_DIR / f"{safe}.pkl.gz"
 
+
+def save_cache():
+    """Persist each symbol independently so one huge JSON file is never read/written."""
+    items = []
+    with DATA_LOCK:
+        snapshot = dict(DATA)
+    for symbol, df in snapshot.items():
+        try:
+            path = _symbol_cache_file(symbol)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            df.to_pickle(tmp, compression="gzip")
+            tmp.replace(path)
+            items.append(symbol)
+        except Exception as exc:
+            print(f"Cache save failed for {symbol}: {exc}")
     try:
-        CACHE_FILE.write_text(json.dumps(payload), encoding="utf-8")
+        CACHE_META_FILE.write_text(json.dumps({"version": CACHE_VERSION, "symbols": items, "saved": datetime.utcnow().isoformat()}), encoding="utf-8")
     except Exception as exc:
-        print(f"Cache save failed: {exc}")
+        print(f"Cache metadata save failed: {exc}")
 
 
 def load_cache():
+    """Load per-symbol caches. Legacy JSON is supported once, but is not rewritten."""
     global DATA
-    if not CACHE_FILE.exists():
-        return
-
-    try:
-        payload = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
-        loaded = {}
-        for symbol, records in payload.items():
-            df = pd.DataFrame(records)
-            if df.empty:
+    loaded = {}
+    files = list(SYMBOL_CACHE_DIR.glob("*.pkl.gz")) if SYMBOL_CACHE_DIR.exists() else []
+    for path in files:
+        try:
+            df = pd.read_pickle(path, compression="gzip")
+            if len(df) < 50:
                 continue
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
             for c in ["open", "high", "low", "close", "volume"]:
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
-            df = df.dropna(subset=["date", "open", "high", "low", "close"])
-            if len(df) >= 50:
-                loaded[symbol] = df.sort_values("date").reset_index(drop=True)
+            df = df.dropna(subset=["date", "open", "high", "low", "close"]).sort_values("date").reset_index(drop=True)
+            # filename maps back to the known NIFTY50 universe
+            for symbol in NIFTY50:
+                if path == _symbol_cache_file(symbol):
+                    loaded[symbol] = df
+                    break
+        except Exception as exc:
+            print(f"Cache load failed for {path.name}: {exc}")
 
-        DATA = loaded
-        print(f"Loaded {len(DATA)} symbols from cache.")
-    except Exception as exc:
-        print(f"Cache load failed: {exc}")
+    # One-time compatibility with the previous v5 JSON cache.
+    if not loaded and CACHE_FILE.exists():
+        try:
+            payload = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            for symbol, records in payload.items():
+                df = pd.DataFrame(records)
+                if len(df) >= 50:
+                    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                    for c in ["open", "high", "low", "close", "volume"]:
+                        if c in df.columns:
+                            df[c] = pd.to_numeric(df[c], errors="coerce")
+                    df = df.dropna(subset=["date", "open", "high", "low", "close"]).sort_values("date").reset_index(drop=True)
+                    loaded[symbol] = df
+            if loaded:
+                DATA = loaded
+                print(f"Loaded {len(DATA)} symbols from legacy cache; converting in background is recommended.")
+                return
+        except Exception as exc:
+            print(f"Legacy cache load failed: {exc}")
+
+    DATA = loaded
+    print(f"Loaded {len(DATA)} symbols from per-symbol cache.")
 
 
 # ============================================================
@@ -236,12 +561,7 @@ def _merge_symbol_data(old_df, new_df):
 
 
 def refresh_worker(period="5y"):
-    """Smart incremental refresh.
-
-    Existing symbols are NOT downloaded for their full history. Only the last
-    CACHE_LOOKBACK_DAYS are requested so today's/new candles can be appended.
-    A symbol with no cache is downloaded with the initial period.
-    """
+    """Smart incremental Yahoo refresh + one batched GitHub cache commit."""
     global REFRESH_STATUS, DATA
 
     with DATA_LOCK:
@@ -254,11 +574,13 @@ def refresh_worker(period="5y"):
             "failed": 0,
             "incremental": 0,
             "initial": 0,
+            "github_pushed": 0,
         }
 
     updated = 0
     initial = 0
     failed = []
+    changed_symbols = []
 
     for idx, symbol in enumerate(NIFTY50):
         with DATA_LOCK:
@@ -266,7 +588,6 @@ def refresh_worker(period="5y"):
 
         latest = _cache_latest(old_df)
         if latest is not None:
-            # Re-fetch a small overlap so revised/latest candles are captured.
             start_date = (latest - pd.Timedelta(days=CACHE_LOOKBACK_DAYS)).date()
             df = download_symbol(symbol, start_date=start_date)
             if df is not None:
@@ -274,8 +595,8 @@ def refresh_worker(period="5y"):
                 with DATA_LOCK:
                     DATA[symbol] = merged
                 updated += 1
+                changed_symbols.append(symbol)
             else:
-                # A temporary Yahoo failure does not destroy the existing cache.
                 failed.append(symbol)
         else:
             df = download_symbol(symbol, period=period)
@@ -284,6 +605,7 @@ def refresh_worker(period="5y"):
                     DATA[symbol] = df
                 initial += 1
                 updated += 1
+                changed_symbols.append(symbol)
             else:
                 failed.append(symbol)
 
@@ -298,23 +620,34 @@ def refresh_worker(period="5y"):
                 f"failed: {len(failed)}."
             )
 
-        # Keep Yahoo request rate conservative.
         if idx < len(NIFTY50) - 1:
             time.sleep(0.35)
 
+    with SIGNAL_CACHE_LOCK:
+        SIGNAL_CACHE.clear()
+
+    # Keep a temporary Render cache for the current process.
+    save_cache()
+
+    # Persist all changed symbols to GitHub in one commit.
+    gh_result = github_push_symbols(changed_symbols) if github_cache_enabled() else {
+        "enabled": False, "pushed": 0, "failed": 0
+    }
+
     with DATA_LOCK:
-        save_cache()
         REFRESH_STATUS["running"] = False
         REFRESH_STATUS["finished"] = datetime.utcnow().isoformat()
+        REFRESH_STATUS["github_pushed"] = gh_result.get("pushed", 0)
         REFRESH_STATUS["message"] = (
             f"Refresh complete. Cache: {len(DATA)}/{len(NIFTY50)} stocks. "
             f"Incremental: {updated - initial}, initial: {initial}, "
-            f"failed: {len(failed)}. Historical data was preserved."
+            f"failed: {len(failed)}. "
+            f"GitHub updated: {gh_result.get('pushed', 0)}."
         )
 
     print(
         f"Smart refresh complete: updated={updated}, initial={initial}, "
-        f"failed={len(failed)}, cached_total={len(DATA)}"
+        f"failed={len(failed)}, github_pushed={gh_result.get('pushed', 0)}"
     )
 
 def start_refresh(period="5y"):
@@ -335,6 +668,18 @@ def start_refresh(period="5y"):
 
 # IMPORTANT: load cache only. NEVER download data during import/startup.
 load_cache()
+
+# On Render restart/redeploy, recover missing historical data from GitHub.
+# This is deliberately asynchronous so /health and Gunicorn can answer quickly.
+try:
+    threading.Thread(
+        target=github_pull_missing_background,
+        name="github-cache-bootstrap",
+        daemon=True,
+    ).start()
+except Exception as exc:
+    GITHUB_CACHE_STATUS["last_error"] = str(exc)
+
 
 
 # ============================================================
@@ -730,31 +1075,32 @@ def simulate_symbol(symbol, raw_df, timeframe, x_pct, max_avg):
 
 
 def calculate_signals(timeframe, x_pct, max_avg):
+    key = (timeframe, round(x_pct, 6), int(max_avg))
+    with SIGNAL_CACHE_LOCK:
+        cached = SIGNAL_CACHE.get(key)
+    if cached is not None:
+        return cached[0], cached[1]
+
     results = []
     errors = []
-
     with DATA_LOCK:
         snapshot = dict(DATA)
-
     if not snapshot:
         return results, ["No market data is cached yet. Click Refresh Data."]
 
     for symbol, raw_df in snapshot.items():
         try:
-            results.append(
-                simulate_symbol(symbol, raw_df, timeframe, x_pct, max_avg)
-            )
+            results.append(simulate_symbol(symbol, raw_df, timeframe, x_pct, max_avg))
         except Exception as exc:
             errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
 
-    order = {
-        "BUY": 0,
-        "AVERAGE": 1,
-        "SELL / HOLD CHECK": 2,
-        "HOLD": 3,
-        "WAIT": 4,
-    }
+    order = {"BUY":0, "AVERAGE":1, "SELL / HOLD CHECK":2, "HOLD":3, "WAIT":4}
     results.sort(key=lambda x: (order.get(x.get("signal"), 9), x["symbol"]))
+    with SIGNAL_CACHE_LOCK:
+        SIGNAL_CACHE[key] = (results, errors)
+        # Keep only a small number of parameter combinations in memory.
+        if len(SIGNAL_CACHE) > 8:
+            SIGNAL_CACHE.pop(next(iter(SIGNAL_CACHE)))
     return results, errors
 
 

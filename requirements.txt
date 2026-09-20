@@ -3,3 +3,6 @@ gunicorn>=23,<24
 pandas>=2.2,<3
 numpy>=2.0,<3
 yfinance>=0.2.60,<1
+
+requests>=2.32.0
+pyarrow>=18.0.0
