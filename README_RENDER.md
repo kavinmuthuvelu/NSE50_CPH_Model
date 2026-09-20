@@ -1,31 +1,33 @@
 # NIFTY 50 SBC Manual Signal Dashboard
 
-## Files
-- `app.py` — Flask dashboard and signal engine
-- `requirements.txt` — Render dependencies
-- `.python-version` — Python 3.13
+## Render deployment
 
-## Render
 Build command:
 `pip install -r requirements.txt`
 
 Start command:
-`gunicorn app:app`
+`gunicorn --workers 1 --timeout 180 app:app`
 
-The app binds to `0.0.0.0:$PORT` and also exposes `/health`.
+The app binds to `0.0.0.0:$PORT`.
+
+## What was fixed for Render
+- Yahoo Finance downloads are split into small batches to reduce rate limiting.
+- Downloads use one thread and retry logic.
+- Zone confirmation checks the impulse candle only when it exists.
+- One Gunicorn worker is used to reduce memory usage on Render Free.
+- Request timeout is extended for the first cold calculation.
 
 ## Strategy
-The signal engine mirrors the attached SBC Supply/Demand backtester:
 - SBC = Body / (High-Low) <= 0.50
-- Unlimited consecutive SBC candles form one base
-- X confirmation is configurable
-- Demand zone tap -> BUY
-- Demand zone tap with open basket -> AVERAGE
-- Supply zone tap with profitable basket -> SELL
-- Supply zone tap while losing -> HOLD
-- Maximum averaging is configurable
-- Suggested manual allocation = 1% of configured capital
+- Consecutive SBC candles form one base.
+- Demand confirmation = close above base high by X%.
+- Supply confirmation = close below base low by X%.
+- Demand tap -> BUY.
+- Demand tap with open basket -> AVERAGE.
+- Supply tap with profitable basket -> SELL.
+- Supply tap while losing -> HOLD.
+- Signals are recommendations only; trades are executed manually.
 
 ## Important
-The dashboard is signal-only. It does not place broker orders.
-The current displayed capital is a configured/manual planning value; it is not automatically synchronized with your real brokerage account.
+The dashboard does not place broker orders.
+The displayed capital is a manual planning input and is not connected to a brokerage account.
